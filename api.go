@@ -406,12 +406,12 @@ func (a *API) getConnections(ctx context.Context) ([]Connection, error) {
 	}
 
 	var cResp listConnectionsResponse
-	if err := json.Unmarshal(raw, &cResp); err == nil {
+	if err := json.Unmarshal(raw, &cResp); err == nil && cResp.Connections != nil {
 		return cResp.Connections, nil
 	}
 
 	var pResp listPeersResponse
-	if err := json.Unmarshal(raw, &pResp); err == nil {
+	if err := json.Unmarshal(raw, &pResp); err == nil && pResp.Peers != nil {
 		conns := make([]Connection, 0, len(pResp.Peers))
 		for _, p := range pResp.Peers {
 			conns = append(conns, Connection{
