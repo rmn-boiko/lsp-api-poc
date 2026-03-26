@@ -37,14 +37,8 @@ func (a *API) handleGetInfo(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithTimeout(r.Context(), a.cfg.HTTPTimeout)
 	defer cancel()
 
-	var payload map[string]any
-	if err := json.Unmarshal([]byte(a.cfg.OpenConnectionPayload), &payload); err != nil {
-		writeErr(w, http.StatusInternalServerError, fmt.Sprintf("invalid OPENCONNECTION_PAYLOAD: %v", err))
-		return
-	}
-
 	var raw json.RawMessage
-	if err := a.lspClient.DoJSON(ctx, http.MethodPost, a.cfg.OpenConnectionPath, payload, &raw); err != nil {
+	if err := a.getOrPost(ctx, a.lspClient, a.cfg.GetInfoPath, &raw); err != nil {
 		writeErr(w, http.StatusBadGateway, err.Error())
 		return
 	}

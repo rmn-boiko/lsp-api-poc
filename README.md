@@ -114,7 +114,7 @@ Without `batch_transfer_idx + asset_id`, the monitor cannot reliably identify wh
 - `RGB_NODE_TOKEN` optional bearer token
 - `HTTP_TIMEOUT` default `15s`
 - `CRON_EVERY` default `30s`
-- `OPENCONNECTION_PAYLOAD` default `{}`
+- `LSP_GET_INFO_PATH` default `/nodeinfo`
 - `LSP_OPENCONNECTION_PATH` default `/connectpeer`
 - `LSP_LISTCONNECTIONS_PATH` default `/listpeers`
 - `LSP_LISTCHANNELS_PATH` default `/listchannels`
@@ -143,7 +143,6 @@ Example (regtest) from your local workspace:
 
 ```bash
 # shell 1: start regtest services
-cd /home/roman-boiko/projects/utexo/rgb-lightning-node
 ./regtest.sh start
 
 # shell 2: start rgb-lightning-node API daemon on :3001
@@ -155,7 +154,6 @@ rgb-lightning-node dataldk0/ --daemon-listening-port 3001 \
 If you do not have the binary in `PATH`, run from source:
 
 ```bash
-cd /home/roman-boiko/projects/utexo/rgb-lightning-node
 cargo run -- dataldk0/ --daemon-listening-port 3001 \
   --ldk-peer-listening-port 9735 --network regtest \
   --disable-authentication
@@ -164,7 +162,6 @@ cargo run -- dataldk0/ --daemon-listening-port 3001 \
 ### 2) Start this API
 
 ```bash
-cd /home/roman-boiko/projects/utexo/lsp-api-poc
 export LSP_BASE_URL="http://127.0.0.1:3001"
 export RGB_NODE_BASE_URL="http://127.0.0.1:3001"
 export CRON_EVERY="10s"
@@ -266,7 +263,6 @@ You can automate the flow with:
 Quick usage:
 
 ```bash
-cd /home/roman-boiko/projects/utexo/lsp-api-poc
 # optional one-time init (skip if already initialized)
 NODE_PASSWORD="password123" ./scripts/poc_flow.sh node-init
 

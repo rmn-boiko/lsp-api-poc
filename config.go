@@ -24,6 +24,7 @@ type Config struct {
 	MinConfirmations uint8
 
 	OpenConnectionPath  string
+	GetInfoPath         string
 	ListConnectionsPath string
 	ListChannelsPath    string
 	OpenChannelPath     string
@@ -42,7 +43,6 @@ type Config struct {
 	DefaultChannelCapacitySat uint64
 	DefaultChannelPushMsat    uint64
 
-	OpenConnectionPayload string
 }
 
 func LoadConfig() Config {
@@ -59,6 +59,7 @@ func LoadConfig() Config {
 		SendRGBFeeRate:            uint64(intOrDefault("SENDRGB_FEE_RATE", 1)),
 		MinConfirmations:          uint8(intOrDefault("MIN_CONFIRMATIONS", 1)),
 		OpenConnectionPath:        envOrDefault("LSP_OPENCONNECTION_PATH", "/connectpeer"),
+		GetInfoPath:               envOrDefault("LSP_GET_INFO_PATH", "/nodeinfo"),
 		ListConnectionsPath:       envOrDefault("LSP_LISTCONNECTIONS_PATH", "/listpeers"),
 		ListChannelsPath:          envOrDefault("LSP_LISTCHANNELS_PATH", "/listchannels"),
 		OpenChannelPath:           envOrDefault("LSP_OPENCHANNEL_PATH", "/openchannel"),
@@ -74,7 +75,6 @@ func LoadConfig() Config {
 		ListTransfersPath:         envOrDefault("RGB_LIST_TRANSFERS_PATH", "/listtransfers"),
 		DefaultChannelCapacitySat: uint64(intOrDefault("DEFAULT_CHANNEL_CAPACITY_SAT", 200000)),
 		DefaultChannelPushMsat:    uint64(intOrDefault("DEFAULT_CHANNEL_PUSH_MSAT", 0)),
-		OpenConnectionPayload:     envOrDefault("OPENCONNECTION_PAYLOAD", "{}"),
 	}
 
 	if cfg.LSPBaseURL == "" {
