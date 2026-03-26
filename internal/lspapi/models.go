@@ -1,4 +1,4 @@
-package main
+package lspapi
 
 import (
 	"encoding/json"
@@ -108,6 +108,32 @@ type listTransfersRequest struct {
 
 type listTransfersResponse struct {
 	Transfers []Transfer `json:"transfers"`
+}
+
+type listUnspentsRequest struct {
+	SkipSync bool `json:"skip_sync"`
+}
+
+type listUnspentsResponse struct {
+	Unspents []Unspent `json:"unspents"`
+}
+
+type Unspent struct {
+	Utxo Utxo `json:"utxo"`
+}
+
+type Utxo struct {
+	Outpoint  string `json:"outpoint"`
+	BtcAmount uint64 `json:"btc_amount"`
+	Colorable bool   `json:"colorable"`
+}
+
+type createUtxosRequest struct {
+	UpTo     bool    `json:"up_to"`
+	Num      *uint8  `json:"num,omitempty"`
+	Size     *uint32 `json:"size,omitempty"`
+	FeeRate  uint64  `json:"fee_rate"`
+	SkipSync bool    `json:"skip_sync"`
 }
 
 type Transfer struct {

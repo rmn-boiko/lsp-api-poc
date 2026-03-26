@@ -11,6 +11,7 @@ DB_PATH="${DB_PATH:-$PROJECT_ROOT/lsp_api_poc.db}"
 WAIT_SECONDS="${WAIT_SECONDS:-15}"
 OPENCHANNEL_VERIFY_TIMEOUT="${OPENCHANNEL_VERIFY_TIMEOUT:-90}"
 OPENCHANNEL_VERIFY_INTERVAL="${OPENCHANNEL_VERIFY_INTERVAL:-5}"
+EXPECT_VIRTUAL_OPEN_MODE="${EXPECT_VIRTUAL_OPEN_MODE:-}"
 
 # Optional bearer token for rgb-lightning-node.
 NODE_TOKEN="${NODE_TOKEN:-}"
@@ -30,10 +31,14 @@ ANNOUNCE_ALIAS="${ANNOUNCE_ALIAS:-null}"
 
 # Inputs for flows.
 ASSET_ID="${ASSET_ID:-}"
+SERVER_ASSET_ID="${SERVER_ASSET_ID:-$ASSET_ID}"
+CLIENT_ASSET_ID="${CLIENT_ASSET_ID:-$ASSET_ID}"
 USER_LN_INVOICE="${USER_LN_INVOICE:-}"
 USER_RGB_INVOICE="${USER_RGB_INVOICE:-}"
 LN_AMT_MSAT="${LN_AMT_MSAT:-3000000}"
 LN_EXPIRY_SEC="${LN_EXPIRY_SEC:-3600}"
+CLIENT_LN_AMT_MSAT="${CLIENT_LN_AMT_MSAT:-3000000}"
+CLIENT_LN_EXPIRY_SEC="${CLIENT_LN_EXPIRY_SEC:-3600}"
 RGB_DURATION_SECONDS="${RGB_DURATION_SECONDS:-3600}"
 RGB_MIN_CONFIRMATIONS="${RGB_MIN_CONFIRMATIONS:-1}"
 RGB_WITNESS="${RGB_WITNESS:-false}"
@@ -48,6 +53,11 @@ AUTO_PAY_RGB="${AUTO_PAY_RGB:-false}"
 # Optional peer bootstrap.
 PEER_PUBKEY_AND_ADDR="${PEER_PUBKEY_AND_ADDR:-}"
 SECOND_NODE_P2P_ADDR="${SECOND_NODE_P2P_ADDR:-127.0.0.1:9736}"
+AUTH_CHECK_PATH="${AUTH_CHECK_PATH:-/nodeinfo}"
+SDK_SMOKE_VIRTUAL_OPEN_MODE="${SDK_SMOKE_VIRTUAL_OPEN_MODE:-}"
+SDK_SMOKE_CHANNEL_CAPACITY_SAT="${SDK_SMOKE_CHANNEL_CAPACITY_SAT:-200000}"
+SDK_SMOKE_CHANNEL_TIMEOUT="${SDK_SMOKE_CHANNEL_TIMEOUT:-90}"
+SDK_SMOKE_CHANNEL_INTERVAL="${SDK_SMOKE_CHANNEL_INTERVAL:-5}"
 
 need_cmd() {
   command -v "$1" >/dev/null 2>&1 || { echo "missing required command: $1"; exit 1; }
@@ -431,6 +441,67 @@ all() {
   monitor
 }
 
+auth_check() {
+  need_cmd curl
+
+  echo "== Auth check =="
+  echo "Node API: $NODE_BASE_URL"
+  echo "Path: $AUTH_CHECK_PATH"
+
+  local tmp_noauth noauth_code tmp_auth auth_code
+  tmp_noauth="$(mktemp)"
+  set +e
+  noauth_code="$(curl -sS -o "$tmp_noauth" -w '%{http_code}' "$NODE_BASE_URL$AUTH_CHECK_PATH")"
+  local noauth_rc=$?
+  set -e
+  if [[ "$noauth_rc" -ne 0 ]]; then
+    echo "request without token failed at transport level"
+    cat "$tmp_noauth" 2>/dev/null || true
+    rm -f "$tmp_noauth"
+    exit 1
+  fi
+
+  echo "-- without token: HTTP $noauth_code"
+  cat "$tmp_noauth" 2>/dev/null || true
+  echo
+
+  if [[ -z "$NODE_TOKEN" ]]; then
+    rm -f "$tmp_noauth"
+    if [[ "$noauth_code" == "401" || "$noauth_code" == "403" ]]; then
+      echo "Auth is enforced. Set NODE_TOKEN and rerun to validate authorized request."
+      return 0
+    fi
+    echo "Auth is not enforced on this node (or endpoint is public)."
+    return 1
+  fi
+
+  tmp_auth="$(mktemp)"
+  set +e
+  auth_code="$(curl -sS -H "Authorization: Bearer $NODE_TOKEN" -o "$tmp_auth" -w '%{http_code}' "$NODE_BASE_URL$AUTH_CHECK_PATH")"
+  local auth_rc=$?
+  set -e
+  if [[ "$auth_rc" -ne 0 ]]; then
+    echo "request with token failed at transport level"
+    cat "$tmp_auth" 2>/dev/null || true
+    rm -f "$tmp_noauth" "$tmp_auth"
+    exit 1
+  fi
+
+  echo "-- with token: HTTP $auth_code"
+  cat "$tmp_auth" 2>/dev/null || true
+  echo
+
+  rm -f "$tmp_noauth" "$tmp_auth"
+
+  if [[ ("$noauth_code" == "401" || "$noauth_code" == "403") && "$auth_code" == "200" ]]; then
+    echo "SUCCESS: auth enforcement and token access both verified."
+    return 0
+  fi
+
+  echo "FAILED: expected no-token 401/403 and token 200."
+  exit 1
+}
+
 two_nodes_openchannel_verify() {
   need_cmd jq
   need_cmd curl
@@ -479,11 +550,28 @@ two_nodes_openchannel_verify() {
   done
 
   echo "-- node A /listchannels"
-  node_curl GET /listchannels || true
+  local final_channels_a final_channels_b
+  final_channels_a="$(node_curl GET /listchannels || true)"
+  echo "$final_channels_a"
   echo
   echo "-- node B /listchannels"
-  second_node_curl GET /listchannels || true
+  final_channels_b="$(second_node_curl GET /listchannels || true)"
+  echo "$final_channels_b"
   echo
+
+  if [[ -n "$EXPECT_VIRTUAL_OPEN_MODE" ]]; then
+    local detected_mode
+    detected_mode="$(printf '%s' "$final_channels_a" | jq -r --arg p "$node_b_pubkey" '.channels // [] | map(select(.peer_pubkey == $p)) | .[0].virtual_open_mode // empty')"
+    if [[ -z "$detected_mode" ]]; then
+      echo "FAILED: expected virtual_open_mode=$EXPECT_VIRTUAL_OPEN_MODE but channel has no virtual_open_mode"
+      exit 1
+    fi
+    if [[ "$detected_mode" != "$EXPECT_VIRTUAL_OPEN_MODE" ]]; then
+      echo "FAILED: expected virtual_open_mode=$EXPECT_VIRTUAL_OPEN_MODE, got $detected_mode"
+      exit 1
+    fi
+    echo "virtual_open_mode verified: $detected_mode"
+  fi
 
   if [[ "$opened" -eq 1 ]]; then
     echo "SUCCESS: channel opened on node A towards node B"
@@ -492,6 +580,150 @@ two_nodes_openchannel_verify() {
     echo "Check: PoC process is running, node unlocked, funds available, and peer connectivity."
     exit 1
   fi
+}
+
+sdk_client_smoke() {
+  need_cmd jq
+  need_cmd curl
+
+  if [[ -z "$SERVER_ASSET_ID" ]]; then
+    echo "SERVER_ASSET_ID (or ASSET_ID) is required for sdk-client-smoke"
+    exit 1
+  fi
+  if [[ -z "$CLIENT_ASSET_ID" ]]; then
+    echo "CLIENT_ASSET_ID (or ASSET_ID) is required for sdk-client-smoke"
+    exit 1
+  fi
+
+  echo "== SDK client smoke (LSP server node + client node) =="
+  echo "PoC API: $API_BASE_URL"
+  echo "Server node (A): $NODE_BASE_URL"
+  echo "Client node (B): $SECOND_NODE_BASE_URL"
+  echo
+
+  echo "-- check node identities"
+  local node_a_info node_b_info node_a_pubkey node_b_pubkey
+  node_a_info="$(node_curl GET /nodeinfo)"
+  node_b_info="$(second_node_curl GET /nodeinfo)"
+  node_a_pubkey="$(printf '%s' "$node_a_info" | jq -r '.pubkey // empty')"
+  node_b_pubkey="$(printf '%s' "$node_b_info" | jq -r '.pubkey // empty')"
+  echo "node_a_pubkey=$node_a_pubkey"
+  echo "node_b_pubkey=$node_b_pubkey"
+  if [[ -z "$node_a_pubkey" || -z "$node_b_pubkey" ]]; then
+    echo "failed to read pubkeys; check both nodes are running and unlocked"
+    exit 1
+  fi
+  if [[ "$node_a_pubkey" == "$node_b_pubkey" ]]; then
+    echo "node A and node B pubkeys are identical; use different datadirs"
+    exit 1
+  fi
+  echo
+
+  if [[ -n "$SDK_SMOKE_VIRTUAL_OPEN_MODE" ]]; then
+    echo "-- ensure virtual channel node A -> node B (mode=$SDK_SMOKE_VIRTUAL_OPEN_MODE)"
+    node_curl POST /connectpeer "{\"peer_pubkey_and_addr\":\"${node_b_pubkey}@${SECOND_NODE_P2P_ADDR}\"}" || true
+
+    local channels_a existing_mode
+    channels_a="$(node_curl GET /listchannels || true)"
+    existing_mode="$(printf '%s' "$channels_a" | jq -r --arg p "$node_b_pubkey" '.channels // [] | map(select(.peer_pubkey == $p)) | .[0].virtual_open_mode // empty')"
+    if [[ "$existing_mode" == "$SDK_SMOKE_VIRTUAL_OPEN_MODE" ]]; then
+      echo "virtual channel already present with mode=$existing_mode"
+    else
+      local open_payload
+      open_payload="$(jq -n \
+        --arg peer "${node_b_pubkey}@${SECOND_NODE_P2P_ADDR}" \
+        --arg mode "$SDK_SMOKE_VIRTUAL_OPEN_MODE" \
+        --argjson cap "$SDK_SMOKE_CHANNEL_CAPACITY_SAT" \
+        '{
+          peer_pubkey_and_opt_addr:$peer,
+          capacity_sat:$cap,
+          push_msat:0,
+          asset_amount:null,
+          asset_id:null,
+          push_asset_amount:null,
+          public:false,
+          with_anchors:true,
+          fee_base_msat:null,
+          fee_proportional_millionths:null,
+          temporary_channel_id:null,
+          virtual_open_mode:$mode
+        }')"
+      node_curl POST /openchannel "$open_payload" || true
+    fi
+
+    local deadline
+    deadline=$((SECONDS + SDK_SMOKE_CHANNEL_TIMEOUT))
+    local mode_detected=""
+    while (( SECONDS < deadline )); do
+      channels_a="$(node_curl GET /listchannels || true)"
+      mode_detected="$(printf '%s' "$channels_a" | jq -r --arg p "$node_b_pubkey" '.channels // [] | map(select(.peer_pubkey == $p)) | .[0].virtual_open_mode // empty')"
+      if [[ "$mode_detected" == "$SDK_SMOKE_VIRTUAL_OPEN_MODE" ]]; then
+        break
+      fi
+      sleep "$SDK_SMOKE_CHANNEL_INTERVAL"
+    done
+    if [[ "$mode_detected" != "$SDK_SMOKE_VIRTUAL_OPEN_MODE" ]]; then
+      echo "failed to confirm virtual_open_mode=$SDK_SMOKE_VIRTUAL_OPEN_MODE on node A channel"
+      node_curl GET /listchannels || true
+      exit 1
+    fi
+    echo "virtual channel mode confirmed: $mode_detected"
+    echo
+  fi
+
+  echo "-- create LN invoice on client node (B)"
+  local ln_resp client_ln_invoice
+  ln_resp="$(second_node_curl POST /lninvoice "{\"amt_msat\":$CLIENT_LN_AMT_MSAT,\"expiry_sec\":$CLIENT_LN_EXPIRY_SEC}")"
+  echo "$ln_resp"
+  client_ln_invoice="$(printf '%s' "$ln_resp" | jq -r '.invoice // empty')"
+  if [[ -z "$client_ln_invoice" ]]; then
+    echo "failed to create client LN invoice"
+    exit 1
+  fi
+  echo
+
+  echo "-- call PoC /lightning_receive with client LN invoice"
+  local lr_payload lr_resp
+  lr_payload="$(jq -n \
+    --arg inv "$client_ln_invoice" \
+    --arg asset "$SERVER_ASSET_ID" \
+    --argjson dur "$RGB_DURATION_SECONDS" \
+    --argjson minc "$RGB_MIN_CONFIRMATIONS" \
+    --argjson wit "$RGB_WITNESS" \
+    '{ln_invoice:$inv,rgb_invoice:{asset_id:$asset,duration_seconds:$dur,min_confirmations:$minc,witness:$wit}}')"
+  lr_resp="$(api_curl POST /lightning_receive "$lr_payload")"
+  echo "$lr_resp"
+  echo
+
+  echo "-- create RGB invoice on client node (B)"
+  local rgb_req rgb_resp client_rgb_invoice
+  rgb_req="$(jq -n \
+    --arg asset "$CLIENT_ASSET_ID" \
+    --argjson dur "$RGB_DURATION_SECONDS" \
+    --argjson minc "$RGB_MIN_CONFIRMATIONS" \
+    --argjson wit "$RGB_WITNESS" \
+    '{asset_id:$asset,duration_seconds:$dur,min_confirmations:$minc,witness:$wit}')"
+  rgb_resp="$(second_node_curl POST /rgbinvoice "$rgb_req")"
+  echo "$rgb_resp"
+  client_rgb_invoice="$(printf '%s' "$rgb_resp" | jq -r '.invoice // empty')"
+  if [[ -z "$client_rgb_invoice" ]]; then
+    echo "failed to create client RGB invoice"
+    exit 1
+  fi
+  echo
+
+  echo "-- call PoC /onchain_send with client RGB invoice"
+  local os_payload os_resp
+  os_payload="$(jq -n \
+    --arg inv "$client_rgb_invoice" \
+    --argjson amt "$LN_AMT_MSAT" \
+    --argjson exp "$LN_EXPIRY_SEC" \
+    '{rgb_invoice:$inv,lninvoice:{amt_msat:$amt,expiry_sec:$exp}}')"
+  os_resp="$(api_curl POST /onchain_send "$os_payload")"
+  echo "$os_resp"
+  echo
+
+  echo "SDK client smoke completed."
 }
 
 usage() {
@@ -508,20 +740,28 @@ Commands:
   pay-rgb           Pay RGB invoice via node /sendrgb (requires RGB_INVOICE env).
   onchain-send       Call PoC /onchain_send.
   monitor            Wait and inspect DB + transfer status.
+  auth-check         Verify RLN auth behavior (no token vs token).
   two-nodes-openchannel-verify
                      Verify PoC cron opens channel from node A to node B.
+  sdk-client-smoke   Use second node as SDK-like client for PoC endpoint smoke test.
   all                Run full sequence.
 
 Environment variables:
   API_BASE_URL, NODE_BASE_URL, NODE_TOKEN, DB_PATH, WAIT_SECONDS
   SECOND_NODE_BASE_URL, SECOND_NODE_TOKEN, SECOND_NODE_P2P_ADDR
   OPENCHANNEL_VERIFY_TIMEOUT, OPENCHANNEL_VERIFY_INTERVAL
+  EXPECT_VIRTUAL_OPEN_MODE
+  SDK_SMOKE_VIRTUAL_OPEN_MODE, SDK_SMOKE_CHANNEL_CAPACITY_SAT
+  SDK_SMOKE_CHANNEL_TIMEOUT, SDK_SMOKE_CHANNEL_INTERVAL
+  AUTH_CHECK_PATH
   NODE_PASSWORD, NODE_MNEMONIC
   BITCOIND_RPC_USERNAME, BITCOIND_RPC_PASSWORD, BITCOIND_RPC_HOST, BITCOIND_RPC_PORT
   INDEXER_URL, PROXY_ENDPOINT, ANNOUNCE_ADDRESSES, ANNOUNCE_ALIAS
   ASSET_ID, USER_LN_INVOICE, USER_RGB_INVOICE
+  SERVER_ASSET_ID, CLIENT_ASSET_ID
   LN_INVOICE, RGB_INVOICE
   LN_AMT_MSAT, LN_EXPIRY_SEC
+  CLIENT_LN_AMT_MSAT, CLIENT_LN_EXPIRY_SEC
   RGB_DURATION_SECONDS, RGB_MIN_CONFIRMATIONS, RGB_WITNESS
   SENDRGB_FEE_RATE, SENDRGB_SKIP_SYNC
   RGB_PAY_AMOUNT
@@ -554,7 +794,9 @@ main() {
       ;;
     onchain-send) onchain_send ;;
     monitor) monitor ;;
+    auth-check) auth_check ;;
     two-nodes-openchannel-verify) two_nodes_openchannel_verify ;;
+    sdk-client-smoke) sdk_client_smoke ;;
     all) all ;;
     *) usage; exit 1 ;;
   esac

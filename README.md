@@ -25,6 +25,14 @@ POC bridge API for RGB + Lightning LSP workflows.
 }
 ```
 
+`/onchain_send` enforces asset consistency with decoded `rgb_invoice`:
+
+- if `lninvoice.asset_id` is provided, it must match decoded RGB `asset_id`
+- if `lninvoice.asset_amount` is provided, it must match decoded fungible assignment amount
+- if omitted, PoC auto-fills `asset_id`/`asset_amount` from decoded RGB invoice when available
+- `lninvoice.expiry_sec` must match decoded RGB invoice remaining lifetime (within tolerance)
+- if `lninvoice.expiry_sec` is omitted/zero, PoC auto-fills it from RGB remaining lifetime
+
 `/lightning_receive`
 
 ```json
@@ -41,15 +49,27 @@ POC bridge API for RGB + Lightning LSP workflows.
 ```
 
 `rgb_invoice.asset_id` is required so the cron monitor can query `listtransfers` deterministically.
+`rgb_invoice.min_confirmations` is controlled by backend (`MIN_CONFIRMATIONS`); caller value is ignored.
+`rgb_invoice.assignment` is backend-controlled:
+
+- default is `Any` (compatible with RLN enum payload)
+- input `"Value"` is accepted as alias and normalized to `Any`
+- unsupported assignment values are rejected
+
+`rgb_invoice.duration_seconds` is validated against LN invoice remaining lifetime:
+
+- if missing/zero, backend auto-fills from decoded LN invoice remaining time
+- if provided, it must match LN remaining lifetime within tolerance
 
 ## Cron jobs
 
 Runs every `CRON_EVERY` (default `30s`):
 
 1. `listpeers` + `listchannels` and auto `openchannel` if channel is missing.
-2. Monitor LN invoices from `onchain_send`; if paid, execute `sendrgb`.
-3. Monitor RGB invoices from `lightning_receive`; if paid, execute `sendpayment`.
-4. Mark expired unpaid invoices as `expired` and optionally call cancel endpoint.
+2. Maintain UTXO pool: if UTXO count drops below `UTXO_MIN_COUNT`, call `createutxos` with `UTXO_TARGET_COUNT - UTXO_MIN_COUNT`.
+3. Monitor LN invoices from `onchain_send`; if paid, execute `sendrgb`.
+4. Monitor RGB invoices from `lightning_receive`; if paid, execute `sendpayment`.
+5. Mark expired unpaid invoices as `expired` and optionally call cancel endpoint.
 
 ## Method mapping and RGB status flow
 
@@ -114,6 +134,9 @@ Without `batch_transfer_idx + asset_id`, the monitor cannot reliably identify wh
 - `RGB_NODE_TOKEN` optional bearer token
 - `HTTP_TIMEOUT` default `15s`
 - `CRON_EVERY` default `30s`
+- `EXPIRY_MATCH_TOLERANCE_SEC` default `5` (allowed deviation between LN `expiry_sec` and RGB remaining lifetime)
+- `MIN_AMT_MSAT` default `3000000` (minimum allowed LN amount in PoC validation)
+- `DEFAULT_RGB_ASSIGNMENT` default `Any` (assignment policy for `/lightning_receive`)
 - `LSP_GET_INFO_PATH` default `/nodeinfo`
 - `LSP_OPENCONNECTION_PATH` default `/connectpeer`
 - `LSP_LISTCONNECTIONS_PATH` default `/listpeers`
@@ -129,8 +152,33 @@ Without `batch_transfer_idx + asset_id`, the monitor cannot reliably identify wh
 - `RGB_INVOICE_PATH` default `/rgbinvoice`
 - `RGB_REFRESH_TRANSFERS_PATH` default `/refreshtransfers`
 - `RGB_LIST_TRANSFERS_PATH` default `/listtransfers`
+- `RGB_LIST_UNSPENTS_PATH` default `/listunspents`
+- `RGB_CREATE_UTXOS_PATH` default `/createutxos`
 - `DEFAULT_CHANNEL_CAPACITY_SAT` default `200000` (used when `listpeers` does not provide channel params)
 - `DEFAULT_CHANNEL_PUSH_MSAT` default `0`
+- `UTXO_MIN_COUNT` default `0` (disabled unless >0)
+- `UTXO_TARGET_COUNT` default `0` (disabled unless >0 and > `UTXO_MIN_COUNT`)
+- `UTXO_SIZE_SAT` default `32000`
+- `UTXO_FEE_RATE` default `1`
+- `UTXO_SKIP_SYNC` default `false`
+- `DEFAULT_VIRTUAL_OPEN_MODE` optional default `virtual_open_mode` for `openchannel` payloads
+- `SUPPORTED_ASSET_IDS` comma-separated allowlist for channel auto-open (example: `assetA,assetB`)
+
+`SUPPORTED_ASSET_IDS` is enforced by cron `reconcileChannels`:
+
+- BTC channels (`asset_id` missing/empty) are allowed
+- RGB channels are auto-opened only when `asset_id` is present and in allowlist
+- RGB `asset_id` not in allowlist is skipped
+
+`SUPPORTED_ASSET_IDS` is also enforced on API requests:
+
+- `POST /lightning_receive`: `rgb_invoice.asset_id` must be in allowlist
+- `POST /onchain_send`: decoded RGB `asset_id` (and effective `lninvoice.asset_id`) must be in allowlist
+
+If `SUPPORTED_ASSET_IDS` is empty, asset-bound flows are rejected by server validation.
+
+If `DEFAULT_VIRTUAL_OPEN_MODE` is set, cron auto-open includes it in `openchannel` payload.
+If connection-specific `openchannel_params.virtual_open_mode` is already present, it is preserved.
 
 ## Test flow
 
@@ -280,6 +328,21 @@ PROXY_ENDPOINT="rpc://127.0.0.1:3000/json-rpc" \
 ./scripts/poc_flow.sh node-initial
 ```
 
+Auth verification (for RLN auth-enabled mode):
+
+```bash
+cd /home/roman-boiko/projects/utexo/lsp-api-poc
+NODE_BASE_URL="http://127.0.0.1:3001" \
+NODE_TOKEN="<YOUR_RLN_TOKEN>" \
+AUTH_CHECK_PATH="/nodeinfo" \
+./scripts/poc_flow.sh auth-check
+```
+
+Expected:
+
+- without token -> `401` or `403`
+- with `NODE_TOKEN` -> `200`
+
 Run `lightning_receive` test:
 
 ```bash
@@ -320,6 +383,75 @@ What it does:
 2. Connects node A -> node B via `/connectpeer`
 3. Polls node A `/listchannels` until channel with node B appears
 4. Prints `/listchannels` for both nodes as final proof
+
+Optional virtual channel verification:
+
+1. Start PoC with a default virtual mode:
+
+```bash
+DEFAULT_VIRTUAL_OPEN_MODE="outbound" go run .
+```
+
+2. Verify opened channel mode in flow:
+
+```bash
+cd /home/roman-boiko/projects/utexo/lsp-api-poc
+NODE_BASE_URL="http://127.0.0.1:3001" \
+SECOND_NODE_BASE_URL="http://127.0.0.1:3002" \
+SECOND_NODE_P2P_ADDR="127.0.0.1:9736" \
+EXPECT_VIRTUAL_OPEN_MODE="outbound" \
+./scripts/poc_flow.sh two-nodes-openchannel-verify
+```
+
+### SDK client node smoke test (LSP server node + client node)
+
+This uses node B as SDK-like client:
+
+1. creates LN invoice on node B and calls PoC `/lightning_receive`
+2. creates RGB invoice on node B and calls PoC `/onchain_send`
+
+```bash
+cd /home/roman-boiko/projects/utexo/lsp-api-poc
+NODE_BASE_URL="http://127.0.0.1:3001" \
+SECOND_NODE_BASE_URL="http://127.0.0.1:3002" \
+SERVER_ASSET_ID="<ASSET_ID_ON_NODE_A>" \
+CLIENT_ASSET_ID="<ASSET_ID_ON_NODE_B>" \
+CLIENT_LN_AMT_MSAT=3000000 \
+CLIENT_LN_EXPIRY_SEC=3600 \
+LN_AMT_MSAT=3000000 \
+LN_EXPIRY_SEC=3600 \
+./scripts/poc_flow.sh sdk-client-smoke
+```
+
+Notes:
+
+- both nodes must be running, unlocked, and use different datadirs/pubkeys
+- `SERVER_ASSET_ID` is used for PoC `/lightning_receive` request
+- `CLIENT_ASSET_ID` is used for client node `/rgbinvoice` request
+- if both sides share one asset, you can still pass `ASSET_ID` only
+- for full settlement (not just request smoke), the environment still needs proper funded assets/channels
+
+Virtual-channel variant for SDK smoke:
+
+```bash
+cd /home/roman-boiko/projects/utexo/lsp-api-poc
+NODE_BASE_URL="http://127.0.0.1:3001" \
+SECOND_NODE_BASE_URL="http://127.0.0.1:3002" \
+SECOND_NODE_P2P_ADDR="127.0.0.1:9736" \
+SERVER_ASSET_ID="<ASSET_ID_ON_NODE_A>" \
+CLIENT_ASSET_ID="<ASSET_ID_ON_NODE_B>" \
+SDK_SMOKE_VIRTUAL_OPEN_MODE="outbound" \
+SDK_SMOKE_CHANNEL_CAPACITY_SAT=200000 \
+SDK_SMOKE_CHANNEL_TIMEOUT=90 \
+SDK_SMOKE_CHANNEL_INTERVAL=5 \
+./scripts/poc_flow.sh sdk-client-smoke
+```
+
+When `SDK_SMOKE_VIRTUAL_OPEN_MODE` is set, script will:
+1. Ensure node A is connected to node B.
+2. Request `/openchannel` with `virtual_open_mode`.
+3. Wait until node A `/listchannels` reports matching `virtual_open_mode`.
+4. Run the regular sdk smoke calls.
 
 Run `onchain_send` test:
 
@@ -365,6 +497,9 @@ Optional envs for node auth/bootstrap:
 - `API_BASE_URL`, `NODE_BASE_URL`, `DB_PATH`, `WAIT_SECONDS`
 - `AUTO_PAY_LN`, `AUTO_PAY_RGB` to auto-pay generated invoices during flow
 - `RGB_PAY_AMOUNT` default `1` (used when decoded RGB invoice assignment is fungible `0`)
+- `SERVER_ASSET_ID`, `CLIENT_ASSET_ID` (for `sdk-client-smoke`; each defaults to `ASSET_ID`)
+- `SDK_SMOKE_VIRTUAL_OPEN_MODE` to force virtual channel open during `sdk-client-smoke`
+- `SDK_SMOKE_CHANNEL_CAPACITY_SAT`, `SDK_SMOKE_CHANNEL_TIMEOUT`, `SDK_SMOKE_CHANNEL_INTERVAL`
 
 Standalone payment helpers:
 

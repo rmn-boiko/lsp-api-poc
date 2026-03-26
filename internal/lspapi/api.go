@@ -1,4 +1,4 @@
-package main
+package lspapi
 
 import (
 	"context"
@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -56,14 +57,31 @@ func (a *API) handleOnchainSend(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, "rgb_invoice is required")
 		return
 	}
-	if req.LNInvoice.ExpirySec == 0 {
-		req.LNInvoice.ExpirySec = 3600
+	if err := ensureLNInvoiceInputMinAmount(&req.LNInvoice, a.cfg.MinAmtMsat); err != nil {
+		writeErr(w, http.StatusBadRequest, err.Error())
+		return
 	}
-
 	ctx, cancel := context.WithTimeout(r.Context(), a.cfg.HTTPTimeout)
 	defer cancel()
 
-	if _, err := a.validateRGBInvoice(ctx, req.RGBInvoice); err != nil {
+	decodedRGB, err := a.validateRGBInvoice(ctx, req.RGBInvoice)
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	if err := applyAndValidateOnchainAssetParams(&req.LNInvoice, decodedRGB); err != nil {
+		writeErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	if err := alignAndValidateLNExpiryWithRGB(&req.LNInvoice, decodedRGB, time.Now().UTC(), a.cfg.ExpiryMatchToleranceSec); err != nil {
+		writeErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	if req.LNInvoice.AssetID == nil || strings.TrimSpace(*req.LNInvoice.AssetID) == "" {
+		writeErr(w, http.StatusBadRequest, "rgb_invoice must contain asset_id for onchain_send")
+		return
+	}
+	if err := a.ensureAssetSupported(strings.TrimSpace(*req.LNInvoice.AssetID)); err != nil {
 		writeErr(w, http.StatusBadRequest, err.Error())
 		return
 	}
@@ -114,20 +132,51 @@ func (a *API) handleLightningReceive(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, "rgb_invoice.asset_id is required for transfer monitoring")
 		return
 	}
-	if req.RGBParams.MinConfirmations == 0 {
-		req.RGBParams.MinConfirmations = a.cfg.MinConfirmations
+	if err := applyAndValidateRGBAssignment(&req.RGBParams, a.cfg.DefaultRGBAssignment); err != nil {
+		writeErr(w, http.StatusBadRequest, err.Error())
+		return
 	}
+	if err := a.ensureAssetSupported(strings.TrimSpace(*req.RGBParams.AssetID)); err != nil {
+		writeErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	applyBackendMinConfirmations(&req.RGBParams, a.cfg.MinConfirmations)
 
 	ctx, cancel := context.WithTimeout(r.Context(), a.cfg.HTTPTimeout)
 	defer cancel()
 
-	if _, err := a.validateLNInvoice(ctx, req.LNInvoice); err != nil {
+	decodedLN, err := a.validateLNInvoice(ctx, req.LNInvoice)
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	if err := ensureDecodedLNMinAmount(decodedLN, a.cfg.MinAmtMsat); err != nil {
+		writeErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	if err := alignAndValidateRGBDurationWithLN(&req.RGBParams, decodedLN, time.Now().UTC(), a.cfg.ExpiryMatchToleranceSec); err != nil {
 		writeErr(w, http.StatusBadRequest, err.Error())
 		return
 	}
 
+	assignmentJSON, err := rgbAssignmentJSON(req.RGBParams.Assignment)
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
+	rgbInvoicePayload := map[string]any{
+		"asset_id":          req.RGBParams.AssetID,
+		"assignment":        assignmentJSON,
+		"min_confirmations": req.RGBParams.MinConfirmations,
+		"witness":           req.RGBParams.Witness,
+	}
+	if req.RGBParams.DurationSeconds != nil && *req.RGBParams.DurationSeconds > 0 {
+		rgbInvoicePayload["duration_seconds"] = req.RGBParams.DurationSeconds
+	}
+
 	var rgbResp rgbInvoiceResponse
-	if err := a.rgbClient.DoJSON(ctx, http.MethodPost, a.cfg.RGBInvoicePath, req.RGBParams, &rgbResp); err != nil {
+	if err := a.rgbClient.DoJSON(ctx, http.MethodPost, a.cfg.RGBInvoicePath, rgbInvoicePayload, &rgbResp); err != nil {
 		writeErr(w, http.StatusBadGateway, wrapErr("failed /rgbinvoice", err).Error())
 		return
 	}
@@ -207,6 +256,9 @@ func (a *API) runCronTick(ctx context.Context) {
 	if err := a.reconcileChannels(ctx); err != nil {
 		log.Printf("cron reconcileChannels: %v", err)
 	}
+	if err := a.maintainUtxos(ctx); err != nil {
+		log.Printf("cron maintainUtxos: %v", err)
+	}
 	if err := a.monitorOnchainSend(ctx); err != nil {
 		log.Printf("cron monitorOnchainSend: %v", err)
 	}
@@ -232,6 +284,11 @@ func (a *API) reconcileChannels(ctx context.Context) error {
 	}
 
 	for _, c := range conns {
+		if !a.isSupportedAsset(c.AssetID) {
+			log.Printf("skip openchannel for unsupported asset_id: %v", c.AssetID)
+			continue
+		}
+
 		peerKey := peerOnly(c.PeerPubkeyAndOptAddr)
 		if _, ok := existing[channelKey(peerKey, c.AssetID)]; ok {
 			continue
@@ -247,6 +304,40 @@ func (a *API) reconcileChannels(ctx context.Context) error {
 		}
 	}
 	return nil
+}
+
+func (a *API) isSupportedAsset(assetID *string) bool {
+	if assetID == nil {
+		// Nil asset means BTC channel; allow it.
+		return true
+	}
+	id := strings.TrimSpace(*assetID)
+	if id == "" {
+		// Empty asset means BTC channel; allow it.
+		return true
+	}
+	for _, supported := range a.cfg.SupportedAssetIDs {
+		if id == supported {
+			return true
+		}
+	}
+	return false
+}
+
+func (a *API) ensureAssetSupported(assetID string) error {
+	assetID = strings.TrimSpace(assetID)
+	if assetID == "" {
+		return errors.New("asset_id is required")
+	}
+	if len(a.cfg.SupportedAssetIDs) == 0 {
+		return errors.New("SUPPORTED_ASSET_IDS is not configured on server")
+	}
+	for _, supported := range a.cfg.SupportedAssetIDs {
+		if assetID == supported {
+			return nil
+		}
+	}
+	return fmt.Errorf("asset_id is not supported: %s", assetID)
 }
 
 func (a *API) monitorOnchainSend(ctx context.Context) error {
@@ -280,6 +371,39 @@ func (a *API) monitorOnchainSend(ctx context.Context) error {
 			a.cancelLNInvoice(ctx, r.LspLNInvoice)
 			_ = a.db.UpdateOnchainStatus(ctx, r.ID, statusExpired, "lsp ln invoice expired")
 		}
+	}
+	return nil
+}
+
+func (a *API) maintainUtxos(ctx context.Context) error {
+	shouldCreate, createNum, err := utxoMaintenanceDecision(a.cfg.UtxoMinCount, a.cfg.UtxoTargetCount)
+	if err != nil {
+		return err
+	}
+	if !shouldCreate {
+		return nil
+	}
+
+	var unspents listUnspentsResponse
+	if err := a.rgbClient.DoJSON(ctx, http.MethodPost, a.cfg.ListUnspentsPath, listUnspentsRequest{SkipSync: a.cfg.UtxoSkipSync}, &unspents); err != nil {
+		return wrapErr(a.cfg.ListUnspentsPath, err)
+	}
+
+	if uint32(len(unspents.Unspents)) >= a.cfg.UtxoMinCount {
+		return nil
+	}
+
+	size := a.cfg.UtxoSizeSat
+	num := createNum
+	req := createUtxosRequest{
+		UpTo:     false,
+		Num:      &num,
+		Size:     &size,
+		FeeRate:  a.cfg.UtxoFeeRate,
+		SkipSync: a.cfg.UtxoSkipSync,
+	}
+	if err := a.lspClient.DoJSON(ctx, http.MethodPost, a.cfg.CreateUtxosPath, req, nil); err != nil {
+		return wrapErr(a.cfg.CreateUtxosPath, err)
 	}
 	return nil
 }
@@ -468,6 +592,11 @@ func (a *API) openChannelPayload(c Connection) (any, error) {
 				payload["push_asset_amount"] = inbound
 			}
 		}
+		if a.cfg.DefaultVirtualOpenMode != "" {
+			if _, ok := payload["virtual_open_mode"]; !ok {
+				payload["virtual_open_mode"] = a.cfg.DefaultVirtualOpenMode
+			}
+		}
 		return payload, nil
 	}
 
@@ -481,6 +610,10 @@ func (a *API) openChannelPayload(c Connection) (any, error) {
 	}
 	if inbound > 0 {
 		req.PushAssetAmount = &inbound
+	}
+	if a.cfg.DefaultVirtualOpenMode != "" {
+		mode := a.cfg.DefaultVirtualOpenMode
+		req.VirtualOpenMode = &mode
 	}
 	return req, nil
 }
@@ -500,6 +633,251 @@ func peerOnly(peerPubkeyAndOptAddr string) string {
 
 func normalizeStatus(v string) string {
 	return strings.ToLower(strings.TrimSpace(v))
+}
+
+func applyAndValidateOnchainAssetParams(ln *LNInvoiceInput, decoded *decodeRGBResponse) error {
+	if ln == nil || decoded == nil {
+		return nil
+	}
+
+	decodedAssetID := ""
+	if decoded.AssetID != nil {
+		decodedAssetID = strings.TrimSpace(*decoded.AssetID)
+	}
+	if ln.AssetID != nil {
+		reqAssetID := strings.TrimSpace(*ln.AssetID)
+		if decodedAssetID == "" || reqAssetID != decodedAssetID {
+			return errors.New("lninvoice.asset_id must match rgb_invoice asset_id")
+		}
+	} else if decodedAssetID != "" {
+		assetIDCopy := decodedAssetID
+		ln.AssetID = &assetIDCopy
+	}
+
+	decodedAmount, hasDecodedAmount := extractFungibleAssignmentAmount(decoded.Assignment)
+	if ln.AssetAmount != nil {
+		if !hasDecodedAmount || *ln.AssetAmount != decodedAmount {
+			return errors.New("lninvoice.asset_amount must match rgb_invoice assignment amount")
+		}
+	} else if hasDecodedAmount {
+		amountCopy := decodedAmount
+		ln.AssetAmount = &amountCopy
+	}
+
+	return nil
+}
+
+func extractFungibleAssignmentAmount(assignment any) (uint64, bool) {
+	m, ok := assignment.(map[string]any)
+	if !ok {
+		return 0, false
+	}
+
+	rawType, ok := m["type"].(string)
+	if !ok || !strings.EqualFold(strings.TrimSpace(rawType), "fungible") {
+		return 0, false
+	}
+
+	rawValue, ok := m["value"]
+	if !ok {
+		return 0, false
+	}
+	return parseUint64(rawValue)
+}
+
+func parseUint64(v any) (uint64, bool) {
+	switch n := v.(type) {
+	case uint64:
+		return n, true
+	case uint32:
+		return uint64(n), true
+	case uint16:
+		return uint64(n), true
+	case uint8:
+		return uint64(n), true
+	case int64:
+		if n < 0 {
+			return 0, false
+		}
+		return uint64(n), true
+	case int32:
+		if n < 0 {
+			return 0, false
+		}
+		return uint64(n), true
+	case int:
+		if n < 0 {
+			return 0, false
+		}
+		return uint64(n), true
+	case float64:
+		if n < 0 || n != float64(uint64(n)) {
+			return 0, false
+		}
+		return uint64(n), true
+	case json.Number:
+		u, err := strconv.ParseUint(n.String(), 10, 64)
+		return u, err == nil
+	case string:
+		u, err := strconv.ParseUint(strings.TrimSpace(n), 10, 64)
+		return u, err == nil
+	default:
+		return 0, false
+	}
+}
+
+func ensureLNInvoiceInputMinAmount(ln *LNInvoiceInput, minAmtMsat uint64) error {
+	if ln == nil || minAmtMsat == 0 {
+		return nil
+	}
+	if ln.AmtMsat == nil {
+		minCopy := minAmtMsat
+		ln.AmtMsat = &minCopy
+		return nil
+	}
+	if *ln.AmtMsat < minAmtMsat {
+		return fmt.Errorf("lninvoice.amt_msat must be >= %d", minAmtMsat)
+	}
+	return nil
+}
+
+func ensureDecodedLNMinAmount(decoded *decodeLNResponse, minAmtMsat uint64) error {
+	if decoded == nil || minAmtMsat == 0 {
+		return nil
+	}
+	if decoded.AmtMsat == nil {
+		return errors.New("ln_invoice must have fixed amount")
+	}
+	if *decoded.AmtMsat < minAmtMsat {
+		return fmt.Errorf("ln_invoice amount must be >= %d msat", minAmtMsat)
+	}
+	return nil
+}
+
+func utxoMaintenanceDecision(minCount, targetCount uint32) (bool, uint8, error) {
+	if minCount == 0 || targetCount == 0 {
+		return false, 0, nil
+	}
+	if targetCount <= minCount {
+		return false, 0, errors.New("UTXO_TARGET_COUNT must be greater than UTXO_MIN_COUNT")
+	}
+	createNum := targetCount - minCount
+	if createNum > 255 {
+		return false, 0, errors.New("UTXO_TARGET_COUNT-UTXO_MIN_COUNT must fit in uint8")
+	}
+	return true, uint8(createNum), nil
+}
+
+func alignAndValidateRGBDurationWithLN(params *RGBInvoiceInput, decodedLN *decodeLNResponse, now time.Time, toleranceSec uint32) error {
+	if params == nil || decodedLN == nil {
+		return nil
+	}
+	expiresAt := int64(decodedLN.Timestamp + decodedLN.ExpirySec)
+	remaining := expiresAt - now.Unix()
+	if remaining <= 0 {
+		return errors.New("ln_invoice already expired")
+	}
+	if remaining > int64(^uint32(0)) {
+		return errors.New("ln_invoice expiration is too far in the future")
+	}
+	expected := uint32(remaining)
+
+	if params.DurationSeconds == nil || *params.DurationSeconds == 0 {
+		v := expected
+		params.DurationSeconds = &v
+		return nil
+	}
+
+	var diff uint32
+	if *params.DurationSeconds >= expected {
+		diff = *params.DurationSeconds - expected
+	} else {
+		diff = expected - *params.DurationSeconds
+	}
+	if diff > toleranceSec {
+		return fmt.Errorf("rgb_invoice.duration_seconds must match ln_invoice remaining lifetime (expected ~%d, got %d, tolerance %d)", expected, *params.DurationSeconds, toleranceSec)
+	}
+	return nil
+}
+
+func applyAndValidateRGBAssignment(params *RGBInvoiceInput, defaultAssignment string) error {
+	if params == nil {
+		return nil
+	}
+	defaultAssignment = strings.TrimSpace(defaultAssignment)
+	if defaultAssignment == "" {
+		defaultAssignment = "Value"
+	}
+	if params.Assignment == nil {
+		assignment := defaultAssignment
+		params.Assignment = &assignment
+		return nil
+	}
+
+	incoming := strings.TrimSpace(*params.Assignment)
+	if incoming == "" {
+		assignment := defaultAssignment
+		params.Assignment = &assignment
+		return nil
+	}
+	if !strings.EqualFold(incoming, "Any") && !strings.EqualFold(incoming, "Value") {
+		return errors.New("rgb_invoice.assignment must be \"Any\" or \"Value\"")
+	}
+	assignment := "Any"
+	params.Assignment = &assignment
+	return nil
+}
+
+func rgbAssignmentJSON(assignment *string) (map[string]any, error) {
+	if assignment == nil {
+		return map[string]any{"type": "Any"}, nil
+	}
+	v := strings.TrimSpace(*assignment)
+	if v == "" || strings.EqualFold(v, "Any") || strings.EqualFold(v, "Value") {
+		return map[string]any{"type": "Any"}, nil
+	}
+	return nil, errors.New("unsupported rgb assignment")
+}
+
+func applyBackendMinConfirmations(params *RGBInvoiceInput, backendMin uint8) {
+	if params == nil {
+		return
+	}
+	params.MinConfirmations = backendMin
+}
+
+func alignAndValidateLNExpiryWithRGB(ln *LNInvoiceInput, decoded *decodeRGBResponse, now time.Time, toleranceSec uint32) error {
+	if ln == nil || decoded == nil {
+		return nil
+	}
+	if decoded.ExpirationTimestamp == nil {
+		return errors.New("rgb_invoice must contain expiration_timestamp")
+	}
+
+	remaining := *decoded.ExpirationTimestamp - now.Unix()
+	if remaining <= 0 {
+		return errors.New("rgb invoice already expired")
+	}
+	if remaining > int64(^uint32(0)) {
+		return errors.New("rgb invoice expiration is too far in the future")
+	}
+
+	expected := uint32(remaining)
+	if ln.ExpirySec == 0 {
+		ln.ExpirySec = expected
+		return nil
+	}
+
+	var diff uint32
+	if ln.ExpirySec >= expected {
+		diff = ln.ExpirySec - expected
+	} else {
+		diff = expected - ln.ExpirySec
+	}
+	if diff > toleranceSec {
+		return fmt.Errorf("lninvoice.expiry_sec must match rgb invoice remaining lifetime (expected ~%d, got %d, tolerance %d)", expected, ln.ExpirySec, toleranceSec)
+	}
+	return nil
 }
 
 func unixFromTimestampAndExpiry(ts, exp uint64) time.Time {
