@@ -6,11 +6,15 @@ PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 
 API_BASE_URL="${API_BASE_URL:-http://127.0.0.1:8080}"
 NODE_BASE_URL="${NODE_BASE_URL:-http://127.0.0.1:3001}"
+SECOND_NODE_BASE_URL="${SECOND_NODE_BASE_URL:-http://127.0.0.1:3002}"
 DB_PATH="${DB_PATH:-$PROJECT_ROOT/lsp_api_poc.db}"
 WAIT_SECONDS="${WAIT_SECONDS:-15}"
+OPENCHANNEL_VERIFY_TIMEOUT="${OPENCHANNEL_VERIFY_TIMEOUT:-90}"
+OPENCHANNEL_VERIFY_INTERVAL="${OPENCHANNEL_VERIFY_INTERVAL:-5}"
 
 # Optional bearer token for rgb-lightning-node.
 NODE_TOKEN="${NODE_TOKEN:-}"
+SECOND_NODE_TOKEN="${SECOND_NODE_TOKEN:-}"
 NODE_PASSWORD="${NODE_PASSWORD:-password123}"
 NODE_MNEMONIC="${NODE_MNEMONIC:-}"
 
@@ -43,6 +47,7 @@ AUTO_PAY_RGB="${AUTO_PAY_RGB:-false}"
 
 # Optional peer bootstrap.
 PEER_PUBKEY_AND_ADDR="${PEER_PUBKEY_AND_ADDR:-}"
+SECOND_NODE_P2P_ADDR="${SECOND_NODE_P2P_ADDR:-127.0.0.1:9736}"
 
 need_cmd() {
   command -v "$1" >/dev/null 2>&1 || { echo "missing required command: $1"; exit 1; }
@@ -66,6 +71,37 @@ node_curl() {
   else
     set +e
     http_code="$(curl -sS -o "$tmp" -w '%{http_code}' -X "$method" "$NODE_BASE_URL$path" "${auth[@]}")"
+    curl_rc=$?
+    set -e
+  fi
+  cat "$tmp" 2>/dev/null || true
+  rm -f "$tmp"
+  if [[ "$curl_rc" -ne 0 ]]; then
+    return "$curl_rc"
+  fi
+  if [[ "$http_code" -ge 400 ]]; then
+    return 22
+  fi
+}
+
+second_node_curl() {
+  local method="$1"; shift
+  local path="$1"; shift
+  local data="${1:-}"
+  local auth=()
+  local tmp http_code curl_rc
+  if [[ -n "$SECOND_NODE_TOKEN" ]]; then
+    auth=(-H "Authorization: Bearer $SECOND_NODE_TOKEN")
+  fi
+  tmp="$(mktemp)"
+  if [[ -n "$data" ]]; then
+    set +e
+    http_code="$(curl -sS -o "$tmp" -w '%{http_code}' -X "$method" "$SECOND_NODE_BASE_URL$path" "${auth[@]}" -H 'content-type: application/json' -d "$data")"
+    curl_rc=$?
+    set -e
+  else
+    set +e
+    http_code="$(curl -sS -o "$tmp" -w '%{http_code}' -X "$method" "$SECOND_NODE_BASE_URL$path" "${auth[@]}")"
     curl_rc=$?
     set -e
   fi
@@ -395,6 +431,69 @@ all() {
   monitor
 }
 
+two_nodes_openchannel_verify() {
+  need_cmd jq
+  need_cmd curl
+
+  echo "== Two-node openchannel verification =="
+  echo "Node A API: $NODE_BASE_URL"
+  echo "Node B API: $SECOND_NODE_BASE_URL"
+  echo
+
+  echo "-- node A /nodeinfo"
+  local node_a_info node_a_pubkey
+  node_a_info="$(node_curl GET /nodeinfo)"
+  echo "$node_a_info"
+  node_a_pubkey="$(printf '%s' "$node_a_info" | jq -r '.pubkey // empty')"
+  echo
+
+  echo "-- node B /nodeinfo"
+  local node_b_info node_b_pubkey
+  node_b_info="$(second_node_curl GET /nodeinfo)"
+  echo "$node_b_info"
+  node_b_pubkey="$(printf '%s' "$node_b_info" | jq -r '.pubkey // empty')"
+  echo
+
+  if [[ -z "$node_a_pubkey" || -z "$node_b_pubkey" ]]; then
+    echo "failed to parse node pubkeys from /nodeinfo"
+    exit 1
+  fi
+
+  local peer_target="${node_b_pubkey}@${SECOND_NODE_P2P_ADDR}"
+  echo "-- connect node A to node B: $peer_target"
+  node_curl POST /connectpeer "{\"peer_pubkey_and_addr\":\"$peer_target\"}" || true
+  echo
+
+  echo "-- waiting for PoC cron to run reconcileChannels/openchannel"
+  local deadline
+  deadline=$((SECONDS + OPENCHANNEL_VERIFY_TIMEOUT))
+  local opened=0
+  while (( SECONDS < deadline )); do
+    local channels_a
+    channels_a="$(node_curl GET /listchannels || true)"
+    if printf '%s' "$channels_a" | jq -e --arg p "$node_b_pubkey" '.channels // [] | any(.peer_pubkey == $p)' >/dev/null 2>&1; then
+      opened=1
+      break
+    fi
+    sleep "$OPENCHANNEL_VERIFY_INTERVAL"
+  done
+
+  echo "-- node A /listchannels"
+  node_curl GET /listchannels || true
+  echo
+  echo "-- node B /listchannels"
+  second_node_curl GET /listchannels || true
+  echo
+
+  if [[ "$opened" -eq 1 ]]; then
+    echo "SUCCESS: channel opened on node A towards node B"
+  else
+    echo "FAILED: channel was not detected within ${OPENCHANNEL_VERIFY_TIMEOUT}s"
+    echo "Check: PoC process is running, node unlocked, funds available, and peer connectivity."
+    exit 1
+  fi
+}
+
 usage() {
   cat <<USAGE
 Usage: $(basename "$0") <command>
@@ -409,10 +508,14 @@ Commands:
   pay-rgb           Pay RGB invoice via node /sendrgb (requires RGB_INVOICE env).
   onchain-send       Call PoC /onchain_send.
   monitor            Wait and inspect DB + transfer status.
+  two-nodes-openchannel-verify
+                     Verify PoC cron opens channel from node A to node B.
   all                Run full sequence.
 
 Environment variables:
   API_BASE_URL, NODE_BASE_URL, NODE_TOKEN, DB_PATH, WAIT_SECONDS
+  SECOND_NODE_BASE_URL, SECOND_NODE_TOKEN, SECOND_NODE_P2P_ADDR
+  OPENCHANNEL_VERIFY_TIMEOUT, OPENCHANNEL_VERIFY_INTERVAL
   NODE_PASSWORD, NODE_MNEMONIC
   BITCOIND_RPC_USERNAME, BITCOIND_RPC_PASSWORD, BITCOIND_RPC_HOST, BITCOIND_RPC_PORT
   INDEXER_URL, PROXY_ENDPOINT, ANNOUNCE_ADDRESSES, ANNOUNCE_ALIAS
@@ -451,6 +554,7 @@ main() {
       ;;
     onchain-send) onchain_send ;;
     monitor) monitor ;;
+    two-nodes-openchannel-verify) two_nodes_openchannel_verify ;;
     all) all ;;
     *) usage; exit 1 ;;
   esac

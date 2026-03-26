@@ -291,6 +291,36 @@ AUTO_PAY_RGB=true \
 ./scripts/poc_flow.sh monitor
 ```
 
+### Verify `openchannel` with 2 nodes
+
+Use this when node A (LSP + PoC target) and node B are both running.
+PoC cron will run `listpeers + listchannels` and call `/openchannel` on node A when channel is missing.
+
+Required:
+
+- PoC server is running (`go run .`) and points to node A (`LSP_BASE_URL=http://127.0.0.1:3001`)
+- node A and node B are unlocked
+- node B is listening for peers (default in script: `127.0.0.1:9736`)
+
+Command:
+
+```bash
+cd /home/roman-boiko/projects/utexo/lsp-api-poc
+NODE_BASE_URL="http://127.0.0.1:3001" \
+SECOND_NODE_BASE_URL="http://127.0.0.1:3002" \
+SECOND_NODE_P2P_ADDR="127.0.0.1:9736" \
+OPENCHANNEL_VERIFY_TIMEOUT=120 \
+OPENCHANNEL_VERIFY_INTERVAL=5 \
+./scripts/poc_flow.sh two-nodes-openchannel-verify
+```
+
+What it does:
+
+1. Reads both node pubkeys via `/nodeinfo`
+2. Connects node A -> node B via `/connectpeer`
+3. Polls node A `/listchannels` until channel with node B appears
+4. Prints `/listchannels` for both nodes as final proof
+
 Run `onchain_send` test:
 
 ```bash
