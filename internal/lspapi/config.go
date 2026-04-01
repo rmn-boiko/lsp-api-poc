@@ -60,7 +60,7 @@ func LoadConfig() Config {
 	cfg := Config{
 		ServerAddr:                envOrDefault("SERVER_ADDR", ":8080"),
 		DatabaseDriver:            envOrDefault("DATABASE_DRIVER", "sqlite"),
-		DatabaseURL:               envOrDefault("DATABASE_URL", "lsp_api_poc.db"),
+		DatabaseURL:               envOrDefault("DATABASE_URL", "utexo_lsp.db"),
 		LSPBaseURL:                strings.TrimRight(envOrDefault("LSP_BASE_URL", "http://127.0.0.1:3001"), "/"),
 		LSPToken:                  os.Getenv("LSP_TOKEN"),
 		RGBNodeBaseURL:            strings.TrimRight(envOrDefault("RGB_NODE_BASE_URL", envOrDefault("LSP_BASE_URL", "http://127.0.0.1:3001")), "/"),

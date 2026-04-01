@@ -1,6 +1,6 @@
 package main
 
-import "lsp-api-poc/internal/lspapi"
+import "utexo-lsp/internal/lspapi"
 
 func main() {
 	lspapi.Run()

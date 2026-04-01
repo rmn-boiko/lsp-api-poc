@@ -42,7 +42,7 @@ func Run() {
 		_ = srv.Shutdown(shutdownCtx)
 	}()
 
-	log.Printf("lsp-api-poc listening on %s", cfg.ServerAddr)
+	log.Printf("utexo-lsp listening on %s", cfg.ServerAddr)
 	if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 		log.Fatalf("server failed: %v", err)
 	}

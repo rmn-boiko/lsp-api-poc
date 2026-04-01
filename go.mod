@@ -1,4 +1,4 @@
-module lsp-api-poc
+module utexo-lsp
 
 go 1.22.2
 
